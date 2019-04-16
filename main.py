@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 import heartpy as hp
 import sampen
 import neurokit
+import json
 from scipy.signal import find_peaks
 from sampen import sampen2
 import numpy as np
@@ -37,20 +38,33 @@ def calculateHRV(bvpdata, sample_rate):
 
   f_data = hp.filtersignal(nparr,sample_rate=sample_rate,order=3, cutoff=[0.5, 4.0], filtertype='bandpass')
   working_data, measures = hp.process(f_data, sample_rate, calc_freq=True)
-  measures['RR_avg'] = np.average(working_data['RR_list_cor'])
-  hr = 60000/measures['RR_avg']
-  measures['HR_avg'] = np.average(hr)
-  measures['ApEn'] = ApEn(working_data['RR_list_cor'], 2, (0.2 * measures['sdnn']))
-  measures['SampEn'] = sampen.sampen2(working_data['RR_list_cor'], 2, (0.2 * measures['sdnn']))
 
-  SD1 = (1 / np.sqrt(2)) * measures['sdsd']  # measures the width of poincare cloud https://github.com/pickus91/HRV/blob/master/poincare.py
-  SD2 = np.sqrt((2 * measures['sdnn'] ** 2) - (0.5 * measures['sdsd'] ** 2))  # measures the length of the poincare cloud
-  measures['SD1'] = SD1
-  measures['SD2'] = SD2
+  data = {
+    'HR_avg': measures['bpm'],
+    'NN_avg': measures['ibi'],
+    'SDNN': measures['sdnn'],
+    'SDSD': measures['sdsd'],
+    'RMSSD': measures['rmssd'],
+    'pNN20': measures['pnn20'],
+    'pNN50': measures['pnn50'],
+    'lf': measures['lf'],
+    'hf': measures['hf'],
+    'lf/hf': measures['lf/hf']
+  }
+
+  data['ApEN'] = ApEn(working_data['RR_list_cor'], 2, (0.2 * data['SDNN']))
+
+  samp_en = sampen.sampen2(working_data['RR_list_cor'], 2, (0.2 * data['SDNN']))
+  data['sampEn'] = samp_en[-1][1]
+
+  SD1 = (1 / np.sqrt(2)) * data['SDSD']  # measures the width of poincare cloud https://github.com/pickus91/HRV/blob/master/poincare.py
+  SD2 = np.sqrt((2 * data['SDNN'] ** 2) - (0.5 * data['SDSD'] ** 2))  # measures the length of the poincare cloud
+  data['SD1'] = SD1
+  data['SD2'] = SD2
   # plot_object = hp.plotter(working_data, measures, show=False)
   # # plot_object.savefig('plot_1.jpg')  # saves the plot as JPEG image.
   # plot_object.show()  # displays plot
-  return measures
+  return data
 
 def calculateSC(scdata, sample_rate):
   data = list(map(lambda x: x['data'], scdata))
@@ -69,7 +83,7 @@ def calculateSC(scdata, sample_rate):
   scr_avg = np.average(scr)
   scr_max = np.amax(scr)
 
-  scr_peaks_number = len(scr_peaks)
+  scr_peaks_number = len(scr_peaks[0])
 
   result = {
     'sc_avg': sc_avg,
@@ -98,6 +112,39 @@ def calculateSC(scdata, sample_rate):
   # plt.show()
   return result
 
+def calculate_SKT(sktata):
+  skt = list(map(lambda x: x['data'], sktata))
+  skt_avg = np.average(skt)
+  skt_slope = np.amax(skt) - np.amin(skt)
+  skt_std = np.std(skt)
+
+  return {
+    'skt_avg': skt_avg,
+    'skt_slope': skt_slope,
+    'skt_std': skt_std
+  }
+
+def calculate_features(user_data, stage):
+  bvp_data = user_data[stage]['bvp']
+  bvp_time = bvp_data[-1]['timeStamp'] - bvp_data[0]['timeStamp']
+  bvp_sample_rate = len(bvp_data) / bvp_time
+
+  edadata = user_data[stage]['eda']
+  eda_time = edadata[-1]['timeStamp'] - edadata[0]['timeStamp']
+  eda_sample_rate = len(edadata)/eda_time
+
+  temp_data = user_data[stage]['temp']
+
+  skt_features = calculate_SKT(temp_data)
+  ppg_features = calculateHRV(bvp_data, bvp_sample_rate)
+  eda_features = calculateSC(edadata, eda_sample_rate)
+
+  return {
+    'skt_features': skt_features,
+    'ppg_features': ppg_features,
+    'eda_features': eda_features
+  }
+
 def _main():
   firebase = pyrebase.initialize_app(config)
 
@@ -109,16 +156,19 @@ def _main():
     data = get_user_data(all_users[user])
     users_data.append(data)
 
-  ba_s_bvpdata = list(map(lambda x: x, users_data[0]['bvp']['ba_s_bvpdata']))
-  bvp_time = ba_s_bvpdata[-1]['timeStamp'] - ba_s_bvpdata[0]['timeStamp']
-  bvp_sample_rate = len(ba_s_bvpdata) / bvp_time
+  BA_S_features = calculate_features(users_data[0], 'BA_S')
+  MIS_S_features = calculate_features(users_data[0], 'MIS_S')
+  MOS_S_features = calculate_features(users_data[0], 'MOS_S')
+  #SES_S_features = calculate_features(users_data[0], 'SES_S')
 
-  ba_s_gsrdata = list(map(lambda x: x, users_data[0]['gsr']['ba_s_gsrdata']))
-  gsr_time = ba_s_gsrdata[-1]['timeStamp'] - ba_s_gsrdata[0]['timeStamp']
-  gsr_sample_rate = len(ba_s_gsrdata)/gsr_time
-
-  ppg_features = calculateHRV(ba_s_bvpdata, bvp_sample_rate)
-  eda_features = calculateSC(ba_s_gsrdata, gsr_sample_rate)
+  result = {
+    'BA_S_features': BA_S_features,
+    'MIS_S_features': MIS_S_features,
+    'MOS_S_features': MOS_S_features,
+    #'SES_S_features': SES_S_features
+  }
+  with open('data.txt', 'w') as outfile:
+    json.dump(result, outfile)
 
   x=1
 
@@ -179,25 +229,40 @@ def get_user_data(user):
     if v['timeStamp'] > float(panelist['SES-SStart'] / 1000) and v['timeStamp'] < float(panelist['SES-SEnd'] / 1000):
       ses_s_ibidata.append(v)
 
+  ba_s_tempdata = []
+  mis_s_tempdata = []
+  mos_s_tempdata = []
+  ses_s_tempdata = []
+  for (k, v) in user['tempData'].items():
+    if v['timeStamp'] > float(panelist['BA-SStart'] / 1000) and v['timeStamp'] < float(panelist['BA-SEnd'] / 1000):
+      ba_s_tempdata.append(v)
+    if v['timeStamp'] > float(panelist['MIS-SStart'] / 1000) and v['timeStamp'] < float(panelist['MIS-SEnd'] / 1000):
+      mis_s_tempdata.append(v)
+    if v['timeStamp'] > float(panelist['MOS-SStart'] / 1000) and v['timeStamp'] < float(panelist['MOS-SEnd'] / 1000):
+      mos_s_tempdata.append(v)
+    if v['timeStamp'] > float(panelist['SES-SStart'] / 1000) and v['timeStamp'] < float(panelist['SES-SEnd'] / 1000):
+      ses_s_tempdata.append(v)
 
   data = {
-    'bvp': {
-      'ba_s_bvpdata': ba_s_bvpdata,
-      'mis_s_bvpdata': mis_s_bvpdata,
-      'mos_s_bvpdata': mos_s_bvpdata,
-      'ses_s_bvpdata': ses_s_bvpdata
+    'BA_S': {
+      'bvp': ba_s_bvpdata,
+      'eda': ba_s_gsrdata,
+      'temp': ba_s_tempdata
     },
-    'gsr': {
-      'ba_s_gsrdata': ba_s_gsrdata,
-      'mis_s_gsrdata': mis_s_gsrdata,
-      'mos_s_gsrdata': mos_s_gsrdata,
-      'ses_s_gsrdata': ses_s_gsrdata
+    'MIS_S': {
+      'bvp': mis_s_bvpdata,
+      'eda': mis_s_gsrdata,
+      'temp': mis_s_tempdata
     },
-    'ibi': {
-      'ba_s_ibidata': ba_s_ibidata,
-      'mis_s_ibidata': mis_s_ibidata,
-      'mos_s_ibidata': mos_s_ibidata,
-      'ses_s_ibidata': ses_s_ibidata
+    'MOS_S': {
+      'bvp': mos_s_bvpdata,
+      'eda': mos_s_gsrdata,
+      'temp': mos_s_tempdata
+    },
+    'SES_S': {
+      'bvp': ses_s_bvpdata,
+      'eda': ses_s_gsrdata,
+      'temp': ses_s_tempdata
     },
 
   }
