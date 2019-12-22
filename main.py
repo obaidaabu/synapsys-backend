@@ -1,10 +1,25 @@
 import matplotlib
-
+import numpy as np
+import mnist
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+from keras.models import Sequential
+from keras.layers import Dense
+from keras.utils import to_categorical
 import pyrebase
+import random
+from keras import optimizers
+
+
 import cvxEDA
 import pandas as pd
 import matplotlib
-
+from numpy import loadtxt
+import xgboost as xgb
+from xgboost import XGBClassifier , XGBRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
+from matplotlib import pyplot
 import seaborn as sns;
 from elm import ELM
 
@@ -38,7 +53,7 @@ config = {
 }
 
 eliminate_time=0
-chunk_time=30
+chunk_time=40
 def eliminate_x_tail(array,x_sec):
     # time = array[-1]['timeStamp'] - array[0]['timeStamp']
     first_time = array[0]['timeStamp']
@@ -246,7 +261,14 @@ def _main():
     firebase = pyrebase.initialize_app(config)
 
     db = firebase.database()
-    all_users = db.child("cho").child("users").get().val()
+    all_users = db.child("cho").child("r-2").get().val()
+
+    # all_users=db.child("cho").child("users").get().val()
+    # for user in all_users:
+    #     results = db.child("cho").child("users").child(user).remove()
+    # #     results = db.child("cho").child("r-1").child(user).set(all_users[user])
+    #     print(1)
+    #child(user).set()
 
     users_data = []
     targets = { 'BA_S':int(0),
@@ -256,71 +278,173 @@ def _main():
 
     }
     for user in all_users:
-        #user='a'
         data = get_user_data(all_users[user])
         data.update({'name': user})
         users_data.append(data)
 
-    for users_data in users_data:
-        BA_S_features_chunks = calculate_panelist_features(users_data, 'BA_S')
-        MIS_S_features_chunks = calculate_panelist_features(users_data, 'MIS_S')
-        MOS_S_features_chunks = calculate_panelist_features(users_data, 'MOS_S')
-        SES_S_features_chunks = calculate_panelist_features(users_data, 'SES_S')
-        RE_S_features_chunks = calculate_panelist_features(users_data, 'RE_S')
+    df = pd.DataFrame()
+    excluded = pd.DataFrame()
+    count=0
+    excludedPanelistsN=1
+    randomExcluded=4
+    for user_data in users_data:
+        if user_data["name"]=="sameha":# or user_data["name"]=="obaida":
+            continue
+        count+=1
+        # if count==randomExcluded:
+        #     df=excluded
+        # else:
+        #     df=included
 
-        df = pd.DataFrame()
+        BA_S_features_chunks = calculate_panelist_features(user_data, 'BA_S')
+        MIS_S_features_chunks = calculate_panelist_features(user_data, 'MIS_S')
+        MOS_S_features_chunks = calculate_panelist_features(user_data, 'MOS_S')
+        SES_S_features_chunks = calculate_panelist_features(user_data, 'SES_S')
+        # RE_S_features_chunks = calculate_panelist_features(user_data, 'RE_S')
+
         for chunk in range(len(BA_S_features_chunks)):
-            BA_S_features_chunks[chunk].update({'tar':targets['BA_S']})
+            BA_S_features_chunks[chunk].update({'tar':targets['BA_S'], 'pi': user_data['name']})
             df = df.append(BA_S_features_chunks[chunk],ignore_index=True)
 
         for chunk in range(len(MIS_S_features_chunks)):
-            BA_S_features_chunks[chunk].update({'tar': targets['MIS_S']})
-            df = df.append(BA_S_features_chunks[chunk], ignore_index=True)
+            MIS_S_features_chunks[chunk].update({'tar': targets['MIS_S'], 'pi': user_data['name']})
+            df = df.append(MIS_S_features_chunks[chunk], ignore_index=True)
 
         for chunk in range(len(MOS_S_features_chunks)):
-            BA_S_features_chunks[chunk].update({'tar': targets['MOS_S']})
-            df = df.append(BA_S_features_chunks[chunk], ignore_index=True)
+            MOS_S_features_chunks[chunk].update({'tar': targets['MOS_S'], 'pi': user_data['name']})
+            df = df.append(MOS_S_features_chunks[chunk], ignore_index=True)
 
+        for chunk in range(len(SES_S_features_chunks)):
+            SES_S_features_chunks[chunk].update({'tar': targets['SES_S'], 'pi': user_data['name']})
+            df = df.append(SES_S_features_chunks[chunk], ignore_index=True)
+
+
+    dfFeatures=df.loc[:, df.columns.difference(['tar','pi'])].copy()
+    dfNoramlized=df.loc[:, df.columns != 'tar'].copy().groupby('pi').transform(lambda x: (x-x.mean())/x.std() if (x.dtype == np.number or x.column ) else x )
+    dfNoramlized = dfFeatures.apply(lambda x: (x-x.mean())/x.std(), axis=0)
+    dfNoramlized = dfFeatures.apply(lambda x: (x - x.min()) / (x.max() - x.min()), axis=0)
+    # dfNoramlized = df.copy()
+    dfNoramlized['tar']=df['tar']
+    dfNoramlized['pi']=df['pi']
+    #
+    # excluded= dfNoramlized.loc[0:46].copy().dropna()
+    excluded = dfNoramlized.loc[dfNoramlized['pi']=='kholod'].dropna()
+    # excluded.loc[excluded['tar'] == 0.0, 'tar'] = -1
+    # excluded.loc[excluded['tar'] != -1.0, 'tar'] = 0
+    # excluded.loc[excluded['tar'] == -1.0, 'tar'] = 1
+
+    # included= dfNoramlized.loc[47:len(df)].copy().dropna()
+    included = dfNoramlized.loc[ ~dfNoramlized['pi'].isin(['kholod','obaida']) ].dropna()
+
+
+    includedTargets = [i if i  else i for i in included['tar'].values.astype(int)]
+    excludedTargets = [i if i  else i for i in excluded['tar'].values.astype(int)]
+    includedFeatures = included.loc[:, included.columns.difference(['tar', 'pi'])].copy().values
+    excludedFeatures = excluded.loc[:, excluded.columns.difference(['tar', 'pi'])].copy().values
+
+    # model = xgb.XGBClassifier(learning_rate=0.002, n_estimators=200, max_depth=20, gamma=1)
+    # model.fit(includedFeatures, includedTargets)
+    # y_pred = model.predict(excludedFeatures)
+    # predictions = [round(value) for value in y_pred]
+    # accuracy = accuracy_score(excludedTargets, predictions)
+
+
+
+    model = Sequential([
+        Dense(220, activation='relu', input_shape=(22,)),
+        Dense(120, activation='relu'),
+        Dense(100, activation='relu'),
+        Dense(20, activation='relu'),
+        Dense(4, activation='softmax'),
+    ])
+    # from keras import optimizers
+
+    # Compile the model.
+    model.compile(
+        optimizer=optimizers.Adam(learning_rate=0.001),
+        loss='categorical_crossentropy',
+        metrics=['accuracy'],
+    )
+
+    # Train the model.
+    model.fit(
+        includedFeatures,
+        to_categorical(includedTargets),
+        epochs=200,
+        batch_size=32,
+    )
+    model.evaluate(
+        excludedFeatures,
+        to_categorical(excludedTargets)
+    )
+    # included.loc[included['tar'] == 0.0, 'tar'] = -1
+    # included.loc[included['tar'] != -1.0, 'tar'] = 0
+    # included.loc[included['tar'] == -1.0, 'tar'] = 1
+    # regersors={}
+    # for indexTarget in range(len(set(list(included['tar'].values)))):
+    #     try:
+    #         # indexTarget=0
+    #         includedTargets =[1 if i == indexTarget else 0 for i in included['tar'].values.astype(int)]
+    #         excludedTargets =[1 if i == indexTarget else 0 for i in excluded['tar'].values.astype(int)]
+    #         includedFeatures = included.loc[:, included.columns.difference(['tar','pi'])].copy().values
+    #         excludedFeatures = excluded.loc[:, excluded.columns.difference(['tar','pi'])].copy().values
     #
 
 
-    data=normalize(df.loc[:, df.columns != 'tar'].copy().values)
-    # sns.pairplot(df, hue='tar');
-    data= df.loc[:, df.columns != 'tar'].copy().values
-    targets =[i if i == 1 else i for i in df['tar'].values.astype(int)]
-    X_train, X_test, y_train, y_test = train_test_split(data,targets,test_size=0.4)
-    from sklearn.naive_bayes import GaussianNB
-    from sklearn.metrics import confusion_matrix
+    #         # Compile the model.
+    #         model = Sequential([
+    #             Dense(220, activation='relu', input_shape=(22,)),
+    #             Dense(120, activation='relu'),
+    #             Dense(100, activation='relu'),
+    #             Dense(20, activation='relu'),
+    #             Dense(2, activation='softmax'),
+    #         ])
+    #         model.compile(
+    #             optimizer='adam',
+    #             loss='categorical_crossentropy',
+    #             metrics=['accuracy'],
+    #         )
+    #
+    #         # Train the model.
+    #         model.fit(
+    #             includedFeatures,
+    #             to_categorical(includedTargets),
+    #             epochs=200,
+    #             batch_size=32,
+    #         )
+    #         model.evaluate(
+    #             excludedFeatures,
+    #             to_categorical(excludedTargets)
+    #         )
+    #         y_pred = model.predict(excludedFeatures)
+    #         predictions = [round(value[1]) for value in y_pred]
+    #         accuracy = accuracy_score(excludedTargets, predictions)
+    #         regersors[indexTarget]={'model':model,'accuracy':accuracy}
+    #     except:
+    #         print("An exception occurred")
+    #
+    #
+    # excludedTargets = [i if i  else i for i in excluded['tar'].values.astype(int)]
+    # dfTest=pd.DataFrame()
+    # dfTest['test']=excludedTargets
+    # for indexTarget in range(len(regersors)):
+    #     y_pred = regersors[indexTarget]['model'].predict(excludedFeatures)
+    #     dfTest[indexTarget]=[val[1]for val in y_pred]
+    #
+    # finalTest=[]
+    # for index,row in dfTest.iterrows():
+    #     maxIndex=-1
+    #     maxVal=-1
+    #     for indexTarget in range(len(regersors)):
+    #         if row[indexTarget]>maxVal:
+    #             maxVal=row[indexTarget]
+    #             maxIndex=indexTarget
+    #
+    #     finalTest.append(maxIndex)
+    #
+    # accuracy = accuracy_score(excludedTargets, finalTest)
+    # print("final excluded Accuracy: %.2f%%" % (accuracy * 100.0))
 
-    gnb = GaussianNB().fit(X_train, y_train)
-    gnb_predictions = gnb.predict(X_test)
-
-    # accuracy on X_test
-    accuracy = gnb.score(X_test, y_test)
-    print
-    accuracy
-
-    # creating a confusion matrix
-    cm = confusion_matrix(y_test, gnb_predictions)
-
-    print("ELM Accuracy %0.3f " % elm.score(X_test, y_test))
-    hid_nums = [1,2,3,4,5,6,7,10, 20, 30]
-
-    target_l = LabelEncoder().fit_transform(targets)
-
-    for hid_num in hid_nums:
-        print(hid_num, end=' ')
-        e = ELM(hid_num)
-
-        ave = 0
-        for i in range(10):
-            cv = KFold(n_splits=5, shuffle=True)
-            scores = cross_val_score(e, data, target_l, cv=cv, scoring='accuracy', n_jobs=-1)
-            ave += scores.mean()
-
-        ave /= 10
-
-        print("Accuracy: %0.3f " % (ave))
 
 
 def get_user_data(user):
@@ -332,12 +456,10 @@ def get_user_data(user):
     panelist['MOS-SEnd'] = user['MOS-SEnd']
     panelist['MOS-SStart'] = user['MOS-SStart']
     panelist['SES-SStart'] = user['SES-SStart']
-    if 'SES-SEnd' in user:
-        panelist['SES-SEnd']=user['SES-SEnd']
-    else:
-        panelist['SES-SEnd'] = 1554307848588
-    panelist['RE-SEnd'] = user['RE-SEnd']
-    panelist['RE-SStart'] = user['RE-SStart']
+    panelist['SES-SEnd']=user['SES-SEnd']
+
+    # panelist['RE-SEnd'] = user['RE-SEnd']
+    # panelist['RE-SStart'] = user['RE-SStart']
     ba_s_bvpdata = []
     mis_s_bvpdata = []
     mos_s_bvpdata = []
@@ -357,9 +479,9 @@ def get_user_data(user):
         if v['timeStamp'] > float(panelist['SES-SStart'] / 1000) and v['timeStamp'] < float(
                 panelist['SES-SEnd'] / 1000):
             ses_s_bvpdata.append(v)
-        if v['timeStamp'] > float(panelist['RE-SStart'] / 1000) and v['timeStamp'] < float(
-                panelist['RE-SEnd'] / 1000):
-            re_s_bvpdata.append(v)
+        # if v['timeStamp'] > float(panelist['RE-SStart'] / 1000) and v['timeStamp'] < float(
+        #         panelist['RE-SEnd'] / 1000):
+        #     re_s_bvpdata.append(v)
 
     ba_s_gsrdata = []
     mis_s_gsrdata = []
@@ -378,31 +500,31 @@ def get_user_data(user):
         if v['timeStamp'] > float(panelist['SES-SStart'] / 1000) and v['timeStamp'] < float(
                 panelist['SES-SEnd'] / 1000):
             ses_s_gsrdata.append(v)
-        if v['timeStamp'] > float(panelist['RE-SStart'] / 1000) and v['timeStamp'] < float(
-                panelist['RE-SEnd'] / 1000):
-            re_s_gsrdata.append(v)
+        # if v['timeStamp'] > float(panelist['RE-SStart'] / 1000) and v['timeStamp'] < float(
+        #         panelist['RE-SEnd'] / 1000):
+        #     re_s_gsrdata.append(v)
 
-    ba_s_ibidata = []
-    mis_s_ibidata = []
-    mos_s_ibidata = []
-    ses_s_ibidata = []
-    re_s_ibidata = []
-
-    for (k, v) in user['ibiData'].items():
-        if v['timeStamp'] > float(panelist['BA-SStart'] / 1000) and v['timeStamp'] < float(panelist['BA-SEnd'] / 1000):
-            ba_s_ibidata.append(v)
-        if v['timeStamp'] > float(panelist['MIS-SStart'] / 1000) and v['timeStamp'] < float(
-                panelist['MIS-SEnd'] / 1000):
-            mis_s_ibidata.append(v)
-        if v['timeStamp'] > float(panelist['MOS-SStart'] / 1000) and v['timeStamp'] < float(
-                panelist['MOS-SEnd'] / 1000):
-            mos_s_ibidata.append(v)
-        if v['timeStamp'] > float(panelist['SES-SStart'] / 1000) and v['timeStamp'] < float(
-                panelist['SES-SEnd'] / 1000):
-            ses_s_ibidata.append(v)
-        if v['timeStamp'] > float(panelist['RE-SStart'] / 1000) and v['timeStamp'] < float(
-                panelist['RE-SEnd'] / 1000):
-            re_s_ibidata.append(v)
+    # ba_s_ibidata = []
+    # mis_s_ibidata = []
+    # mos_s_ibidata = []
+    # ses_s_ibidata = []
+    # re_s_ibidata = []
+    #
+    # for (k, v) in user['ibiData'].items():
+    #     if v['timeStamp'] > float(panelist['BA-SStart'] / 1000) and v['timeStamp'] < float(panelist['BA-SEnd'] / 1000):
+    #         ba_s_ibidata.append(v)
+    #     if v['timeStamp'] > float(panelist['MIS-SStart'] / 1000) and v['timeStamp'] < float(
+    #             panelist['MIS-SEnd'] / 1000):
+    #         mis_s_ibidata.append(v)
+    #     if v['timeStamp'] > float(panelist['MOS-SStart'] / 1000) and v['timeStamp'] < float(
+    #             panelist['MOS-SEnd'] / 1000):
+    #         mos_s_ibidata.append(v)
+    #     if v['timeStamp'] > float(panelist['SES-SStart'] / 1000) and v['timeStamp'] < float(
+    #             panelist['SES-SEnd'] / 1000):
+    #         ses_s_ibidata.append(v)
+    #     if v['timeStamp'] > float(panelist['RE-SStart'] / 1000) and v['timeStamp'] < float(
+    #             panelist['RE-SEnd'] / 1000):
+    #         re_s_ibidata.append(v)
 
     ba_s_tempdata = []
     mis_s_tempdata = []
@@ -422,9 +544,9 @@ def get_user_data(user):
         if v['timeStamp'] > float(panelist['SES-SStart'] / 1000) and v['timeStamp'] < float(
                 panelist['SES-SEnd'] / 1000):
             ses_s_tempdata.append(v)
-        if v['timeStamp'] > float(panelist['RE-SStart'] / 1000) and v['timeStamp'] < float(
-                panelist['RE-SEnd'] / 1000):
-            re_s_tempdata.append(v)
+        # if v['timeStamp'] > float(panelist['RE-SStart'] / 1000) and v['timeStamp'] < float(
+        #         panelist['RE-SEnd'] / 1000):
+        #     re_s_tempdata.append(v)
 
     data = {
         'BA_S': {
